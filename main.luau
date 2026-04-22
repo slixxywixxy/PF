@@ -28,13 +28,24 @@ local CONFIG = {
 	num_current_feats = 5,
 	num_lookahead_feats = 4,
 	lookahead_k = 10,
-	num_extra = 35,
 	prev_finger_dim = 6,
 	pitch_delta_range = 24,
 	pitch_delta_buckets = 49,
 	middle_c = 60,
-	input_dim = 59,
 }
+-- Derived sizes.  Previously these were hardcoded (num_extra=35, input_dim=59)
+-- which silently broke buffer sizing whenever lookahead_k was changed, because
+-- build_input_buf writes lookahead_k * num_lookahead_feats floats into a slot
+-- past the last lookahead index.  With the trained weights, lookahead_k MUST
+-- stay at 6 (the LSTM's first-layer input dimension is baked into w_ih_0), but
+-- computing these from CONFIG at least produces a correctly-sized buffer if
+-- someone later changes the layout and retrains.  A mismatch between
+-- input_dim and the weight matrix is caught during inference by a size check.
+CONFIG.num_extra =
+	CONFIG.num_current_feats
+	+ CONFIG.lookahead_k * CONFIG.num_lookahead_feats
+	+ CONFIG.prev_finger_dim
+CONFIG.input_dim = CONFIG.embed_dim + CONFIG.num_extra
 
 local FLOAT_SIZE = 4
 
@@ -9666,10 +9677,38 @@ local W = {
 local HIDDEN = CONFIG.hidden
 local NUM_FINGERS = CONFIG.num_fingers
 local EMBED_DIM = CONFIG.embed_dim
-local INPUT_DIM = CONFIG.input_dim        -- embed_dim + num_extra
+local INPUT_DIM = CONFIG.input_dim        -- embed_dim + num_extra (derived)
 local L0_INPUT = INPUT_DIM                -- layer 0 input width
 local L1_INPUT = HIDDEN                   -- layer 1 input width (from layer 0 output)
 local FOUR_H = 4 * HIDDEN
+
+-- Sanity-check that the (now-derived) INPUT_DIM matches the shape the trained
+-- weights expect.  w_ih_0 is stored row-major as (4*hidden, input_dim) f32, so
+-- its byte length must equal 4 * hidden * input_dim * FLOAT_SIZE.  If a future
+-- config change makes these diverge, fail loudly at require-time instead of
+-- later producing nonsense predictions or — worse — a silent buffer-OOB.
+do
+	local expected_w_ih_0 = 4 * HIDDEN * INPUT_DIM * FLOAT_SIZE
+	local actual_w_ih_0 = buffer.len(W.w_ih_0)
+	if actual_w_ih_0 ~= expected_w_ih_0 then
+		error(string.format(
+			"PianoFingering: input_dim mismatch.  CONFIG yields input_dim=%d "
+			.. "(embed=%d + extra=%d, where extra = num_current_feats(%d) "
+			.. "+ lookahead_k(%d) * num_lookahead_feats(%d) + prev_finger_dim(%d)), "
+			.. "but trained w_ih_0 expects input_dim=%d.  The bundled weights are "
+			.. "only valid for the exact feature layout they were trained on — "
+			.. "changing lookahead_k / num_current_feats / etc. requires "
+			.. "retraining.",
+			INPUT_DIM,
+			EMBED_DIM, CONFIG.num_extra,
+			CONFIG.num_current_feats,
+			CONFIG.lookahead_k,
+			CONFIG.num_lookahead_feats,
+			CONFIG.prev_finger_dim,
+			actual_w_ih_0 // (4 * HIDDEN * FLOAT_SIZE)
+		))
+	end
+end
 
 -- ----------------------------------------------------------------------------
 -- Math helpers (type-annotated for native codegen)
@@ -9700,72 +9739,53 @@ local function lstm_step(
 	w_ih: buffer, w_hh: buffer, bias: buffer,
 	x: buffer, h_prev: buffer, c_prev: buffer,
 	in_dim: number, hidden: number,
-	h_out: buffer, c_out: buffer
+	h_out: buffer, c_out: buffer,
+	preact: buffer        -- scratch: 4*hidden f32s for gate pre-activations
 )
-	-- For each gate output row k in [0, 4H), compute
-	--   pre = bias[k] + sum_j w_ih[k, j] * x[j] + sum_j w_hh[k, j] * h_prev[j]
-	-- Then apply activation per gate segment.
+	-- Single-pass pre-activation computation.  The previous implementation
+	-- split this into two passes: the first wrote i/f into h_out/c_out as
+	-- scratch and skipped g/o, then the second recomputed g/o from
+	-- scratch.  That doubled the matmul work for two of the four gates.
+	-- Using a 4H scratch buffer lets every gate row be computed exactly
+	-- once — numerically identical, but ~33% fewer inner-loop multiplies.
+	-- (For layer 0 this is (3 × 96 × 155) vs (6 × 96 × 155) pre-fix.)
+	--
+	-- Keeping the `s` accumulator in a local across the k-row avoids the
+	-- read-accumulate-write-into-preact-every-j pattern, which would cost
+	-- 2 extra buffer ops per inner iteration.
 	local four_h: number = 4 * hidden
+	local in_stride: number = in_dim * FLOAT_SIZE
+	local hh_stride: number = hidden * FLOAT_SIZE
 
 	for k = 0, four_h - 1 do
-		local row_ih_base: number = k * in_dim * FLOAT_SIZE
-		local row_hh_base: number = k * hidden * FLOAT_SIZE
 		local s: number = buffer.readf32(bias, k * FLOAT_SIZE)
+		local row_ih_base: number = k * in_stride
 		for j = 0, in_dim - 1 do
 			s += buffer.readf32(w_ih, row_ih_base + j * FLOAT_SIZE)
 				* buffer.readf32(x, j * FLOAT_SIZE)
 		end
+		local row_hh_base: number = k * hh_stride
 		for j = 0, hidden - 1 do
 			s += buffer.readf32(w_hh, row_hh_base + j * FLOAT_SIZE)
 				* buffer.readf32(h_prev, j * FLOAT_SIZE)
 		end
-		-- Stash the pre-activation where it belongs; we'll apply activations
-		-- in a second pass. To avoid a 4H scratch buffer, abuse h_out/c_out
-		-- as temporary scratch for the i and f gates, then use local scalars
-		-- for g and o in the second pass.
-		if k < hidden then
-			buffer.writef32(h_out, k * FLOAT_SIZE, s)
-		elseif k < 2 * hidden then
-			buffer.writef32(c_out, (k - hidden) * FLOAT_SIZE, s)
-		else
-			-- For g and o gates, we have to recompute in the second pass
-			-- (or use a scratch buffer — we opt to recompute for simplicity
-			-- and because the second pass runs H iterations, not 2H).
-		end
+		buffer.writef32(preact, k * FLOAT_SIZE, s)
 	end
 
-	-- Second pass: recompute g and o pre-activations, apply activations,
-	-- write final h_out and c_out.
+	-- Activations and output.  Gate layout: i, f, g, o (each H wide).
+	local f_base: number = hidden * FLOAT_SIZE
+	local g_base: number = 2 * hidden * FLOAT_SIZE
+	local o_base: number = 3 * hidden * FLOAT_SIZE
 	for k = 0, hidden - 1 do
-		local kg: number = 2 * hidden + k
-		local ko: number = 3 * hidden + k
-		local row_g_ih: number = kg * in_dim * FLOAT_SIZE
-		local row_g_hh: number = kg * hidden * FLOAT_SIZE
-		local row_o_ih: number = ko * in_dim * FLOAT_SIZE
-		local row_o_hh: number = ko * hidden * FLOAT_SIZE
-		local sg: number = buffer.readf32(bias, kg * FLOAT_SIZE)
-		local so: number = buffer.readf32(bias, ko * FLOAT_SIZE)
-		for j = 0, in_dim - 1 do
-			local xj: number = buffer.readf32(x, j * FLOAT_SIZE)
-			sg += buffer.readf32(w_ih, row_g_ih + j * FLOAT_SIZE) * xj
-			so += buffer.readf32(w_ih, row_o_ih + j * FLOAT_SIZE) * xj
-		end
-		for j = 0, hidden - 1 do
-			local hj: number = buffer.readf32(h_prev, j * FLOAT_SIZE)
-			sg += buffer.readf32(w_hh, row_g_hh + j * FLOAT_SIZE) * hj
-			so += buffer.readf32(w_hh, row_o_hh + j * FLOAT_SIZE) * hj
-		end
-
-		local i_pre: number = buffer.readf32(h_out, k * FLOAT_SIZE)
-		local f_pre: number = buffer.readf32(c_out, k * FLOAT_SIZE)
-		local i_gate: number = sigmoid(i_pre)
-		local f_gate: number = sigmoid(f_pre)
-		local g_val: number = tanh(sg)
-		local o_gate: number = sigmoid(so)
-		local c_prev_k: number = buffer.readf32(c_prev, k * FLOAT_SIZE)
-		local c_new: number = f_gate * c_prev_k + i_gate * g_val
-		buffer.writef32(c_out, k * FLOAT_SIZE, c_new)
-		buffer.writef32(h_out, k * FLOAT_SIZE, o_gate * tanh(c_new))
+		local k_off: number = k * FLOAT_SIZE
+		local i_gate: number = sigmoid(buffer.readf32(preact, k_off))
+		local f_gate: number = sigmoid(buffer.readf32(preact, f_base + k_off))
+		local g_val:  number = tanh(buffer.readf32(preact, g_base + k_off))
+		local o_gate: number = sigmoid(buffer.readf32(preact, o_base + k_off))
+		local c_prev_k: number = buffer.readf32(c_prev, k_off)
+		local c_new:  number = f_gate * c_prev_k + i_gate * g_val
+		buffer.writef32(c_out, k_off, c_new)
+		buffer.writef32(h_out, k_off, o_gate * tanh(c_new))
 	end
 end
 
@@ -9863,17 +9883,24 @@ export type Session = {
 	isLeftHand: boolean,
 	pending: {any},
 	nextIdx: number,
-	-- Per-layer h and c buffers (pre-allocated)
+	-- Per-layer hidden / cell state (persist across steps)
 	h0: buffer, c0: buffer, h1: buffer, c1: buffer,
-	-- Scratch buffers for the inference step
+	-- Scratch for the inference step
 	input_buf: buffer,
-	layer0_out: buffer,
-	h_scratch: buffer, c_scratch: buffer,
+	preact: buffer,        -- 4*hidden f32s used by lstm_step
 	logits: buffer,
 	prev_midi: number, prev_onset: number, prev_offset: number,
 	prev_finger: number,
 	firstDone: boolean,
 	pendingOut: {{idx: number, finger: number}},
+	-- Same-hand overlap tracker.  Each entry: { finger, offset } for the
+	-- last few anchor predictions.  emit_oldest masks out any finger whose
+	-- offset is still in the future at the current note's onset, because
+	-- a physical finger cannot simultaneously play two different pitches.
+	-- The trained NN never sees held-finger state, so this mask is the
+	-- sole mechanism preventing it from proposing an impossible reuse
+	-- of a still-sounding finger from a prior anchor.
+	recent: {{finger: number, offset: number}},
 }
 
 local PianoFingering = {}
@@ -9889,9 +9916,7 @@ function PianoFingering.newSession(isLeftHand: boolean): Session
 		h1 = buffer.create(H_BYTES),
 		c1 = buffer.create(H_BYTES),
 		input_buf = buffer.create(INPUT_DIM * FLOAT_SIZE),
-		layer0_out = buffer.create(H_BYTES),
-		h_scratch = buffer.create(H_BYTES),
-		c_scratch = buffer.create(H_BYTES),
+		preact = buffer.create(FOUR_H * FLOAT_SIZE),
 		logits = buffer.create(NUM_FINGERS * FLOAT_SIZE),
 		prev_midi = 0,
 		prev_onset = 0,
@@ -9899,6 +9924,7 @@ function PianoFingering.newSession(isLeftHand: boolean): Session
 		prev_finger = 0,
 		firstDone = false,
 		pendingOut = {},
+		recent = {},
 	}
 end
 
@@ -9923,30 +9949,69 @@ local function emit_oldest(sess: Session)
 	)
 	sess.firstDone = true
 
-	-- Layer 0: input_buf -> layer0_out
+	-- Layer 0: x = input_buf; h/c in place on sess.h0/sess.c0.
+	-- lstm_step reads h_prev fully before writing h_out, and reads
+	-- c_prev[k] then writes c_out[k] within a single k iteration, so
+	-- aliasing h_prev==h_out and c_prev==c_out is safe and lets us
+	-- avoid the four scratch->state copies the old code required.
 	lstm_step(
 		W.w_ih_0, W.w_hh_0, W.b_0,
 		sess.input_buf, sess.h0, sess.c0,
 		L0_INPUT, HIDDEN,
-		sess.h_scratch, sess.c_scratch
+		sess.h0, sess.c0,
+		sess.preact
 	)
-	-- Copy scratch into session state AND layer0_out (they're the same data)
-	buffer.copy(sess.h0, 0, sess.h_scratch, 0, HIDDEN * FLOAT_SIZE)
-	buffer.copy(sess.c0, 0, sess.c_scratch, 0, HIDDEN * FLOAT_SIZE)
-	buffer.copy(sess.layer0_out, 0, sess.h_scratch, 0, HIDDEN * FLOAT_SIZE)
 
-	-- Layer 1: layer0_out -> h_scratch
+	-- Layer 1: x = sess.h0 (layer 0 output); h/c in place on sess.h1/sess.c1.
 	lstm_step(
 		W.w_ih_1, W.w_hh_1, W.b_1,
-		sess.layer0_out, sess.h1, sess.c1,
+		sess.h0, sess.h1, sess.c1,
 		L1_INPUT, HIDDEN,
-		sess.h_scratch, sess.c_scratch
+		sess.h1, sess.c1,
+		sess.preact
 	)
-	buffer.copy(sess.h1, 0, sess.h_scratch, 0, HIDDEN * FLOAT_SIZE)
-	buffer.copy(sess.c1, 0, sess.c_scratch, 0, HIDDEN * FLOAT_SIZE)
 
-	-- Head: h_scratch -> logits
-	linear_head(sess.h_scratch, sess.logits)
+	-- Head: h1 -> logits
+	linear_head(sess.h1, sess.logits)
+
+	-- --------------------------------------------------------------------
+	-- Same-hand overlap mask.
+	--
+	-- The NN has no feature telling it which fingers are still physically
+	-- held at cur.onset (its input only knows the immediately-previous
+	-- note and a pitch-delta lookahead — it does not see offset timing
+	-- for earlier anchors).  Without a mask it will happily re-emit a
+	-- finger that is still sounding from a prior note, which is
+	-- physically impossible and drives a lot of the "LH 3 2 5" style
+	-- glitches downstream.
+	--
+	-- We track recent anchor outputs in sess.recent and, at each new
+	-- note, zero-out (set to -inf) any finger whose previous note has
+	-- not yet released (offset > cur.onset).  If every finger is held
+	-- we skip the mask rather than return garbage — the hand can't
+	-- physically play in that state and we let the model's best guess
+	-- fall through for downstream repair.
+	-- --------------------------------------------------------------------
+	local masked: { [number]: boolean }? = nil
+	local free_count: number = NUM_FINGERS
+	if #sess.recent > 0 then
+		masked = {}
+		for _, r in ipairs(sess.recent) do
+			if r.offset > cur.onset and not (masked :: any)[r.finger] then
+				(masked :: any)[r.finger] = true
+				free_count -= 1
+			end
+		end
+	end
+	if masked and free_count > 0 then
+		local NEG_INF: number = -math.huge
+		for f = 1, NUM_FINGERS do
+			if (masked :: any)[f] then
+				buffer.writef32(sess.logits, (f - 1) * FLOAT_SIZE, NEG_INF)
+			end
+		end
+	end
+
 	local finger = argmax5(sess.logits)
 
 	-- Save state for next step
@@ -9954,6 +10019,19 @@ local function emit_oldest(sess: Session)
 	sess.prev_onset = cur.onset
 	sess.prev_offset = cur.offset
 	sess.prev_finger = finger
+
+	-- Record this anchor for future overlap masking.  Prune entries
+	-- whose note has already released by cur.onset so the list stays
+	-- tiny (at most NUM_FINGERS live entries in practice).
+	local recent = sess.recent
+	local keep = {}
+	for _, r in ipairs(recent) do
+		if r.offset > cur.onset and r.finger ~= finger then
+			table.insert(keep, r)
+		end
+	end
+	table.insert(keep, {finger = finger, offset = cur.offset})
+	sess.recent = keep
 
 	local out_finger = sess.isLeftHand and -finger or finger
 	table.insert(sess.pendingOut, {idx = cur.absIdx, finger = out_finger})
