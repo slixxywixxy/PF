@@ -18,6 +18,15 @@
 --   local tail = PF.flush(sess)
 --   -- or batch:
 --   local allFingers = PF.predict(notes)
+--
+-- Confidence / full posterior:
+--   Each entry returned by drain/flush now carries a `confidence: number?`
+--   field (softmax probability of the picked finger, masked-logit aware).
+--   Callers who need the full 5-finger distribution can use:
+--     local dists = PF.drainWithDist(sess)      -- [{idx, finger, dist={p1..p5}}, ...]
+--     local allDists = PF.predictWithDist(notes) -- { [eventIdx] = {p1..p5}, ... }
+--   drain and drainWithDist share a single internal queue: calling either one
+--   resets both so a subsequent call does not re-emit the same events.
 -- -----------------------------------------------------------------------------
 
 local CONFIG = {
@@ -9812,6 +9821,63 @@ local function argmax5(buf: buffer): number
 	return best_i
 end
 
+-- Numerically-stable softmax over the 5 finger logits.  Writes probabilities
+-- into `out` (same layout as `logits`) and returns the argmax alongside its
+-- probability.  Masked entries in `logits` (−inf) produce probability 0 in
+-- `out` without any special-case handling thanks to the standard max-shift
+-- trick.  Hot path — kept branch-free over the 5 elements.
+local function softmax5(logits: buffer, out: buffer): (number, number)
+	local l0: number = buffer.readf32(logits, 0)
+	local l1: number = buffer.readf32(logits, 1 * FLOAT_SIZE)
+	local l2: number = buffer.readf32(logits, 2 * FLOAT_SIZE)
+	local l3: number = buffer.readf32(logits, 3 * FLOAT_SIZE)
+	local l4: number = buffer.readf32(logits, 4 * FLOAT_SIZE)
+
+	local m: number = l0
+	local best_i: number = 1
+	if l1 > m then m = l1; best_i = 2 end
+	if l2 > m then m = l2; best_i = 3 end
+	if l3 > m then m = l3; best_i = 4 end
+	if l4 > m then m = l4; best_i = 5 end
+
+	-- If every logit is −inf (every finger masked) the max-shift would be
+	-- −inf − −inf = nan; emit a uniform distribution and an arbitrary best.
+	if m == -math.huge then
+		local u: number = 1 / NUM_FINGERS
+		for i = 0, NUM_FINGERS - 1 do
+			buffer.writef32(out, i * FLOAT_SIZE, u)
+		end
+		return 1, u
+	end
+
+	local e0: number = math.exp(l0 - m)
+	local e1: number = math.exp(l1 - m)
+	local e2: number = math.exp(l2 - m)
+	local e3: number = math.exp(l3 - m)
+	local e4: number = math.exp(l4 - m)
+	local z: number = e0 + e1 + e2 + e3 + e4
+	local inv: number = 1 / z
+
+	local p0: number = e0 * inv
+	local p1: number = e1 * inv
+	local p2: number = e2 * inv
+	local p3: number = e3 * inv
+	local p4: number = e4 * inv
+	buffer.writef32(out, 0,               p0)
+	buffer.writef32(out, 1 * FLOAT_SIZE,  p1)
+	buffer.writef32(out, 2 * FLOAT_SIZE,  p2)
+	buffer.writef32(out, 3 * FLOAT_SIZE,  p3)
+	buffer.writef32(out, 4 * FLOAT_SIZE,  p4)
+
+	local best_p: number
+	if     best_i == 1 then best_p = p0
+	elseif best_i == 2 then best_p = p1
+	elseif best_i == 3 then best_p = p2
+	elseif best_i == 4 then best_p = p3
+	else                    best_p = p4 end
+	return best_i, best_p
+end
+
 -- ----------------------------------------------------------------------------
 -- Feature building. Writes directly into a provided input buffer.
 -- ----------------------------------------------------------------------------
@@ -9889,10 +9955,16 @@ export type Session = {
 	input_buf: buffer,
 	preact: buffer,        -- 4*hidden f32s used by lstm_step
 	logits: buffer,
+	probs: buffer,         -- NUM_FINGERS f32s; softmax of logits (post-mask)
 	prev_midi: number, prev_onset: number, prev_offset: number,
 	prev_finger: number,
 	firstDone: boolean,
-	pendingOut: {{idx: number, finger: number}},
+	-- Per-emit output carries both the argmax finger and its softmax
+	-- probability so downstream callers can distinguish a 95%-confident pick
+	-- from a 40/35/25 three-way tie.  The full distribution is available via
+	-- PianoFingering.drainWithDist if all five probabilities are needed.
+	pendingOut: {{idx: number, finger: number, confidence: number?}},
+	pendingDist: {{idx: number, finger: number, dist: {number}}},
 	-- Same-hand overlap tracker.  Each entry: { finger, offset } for the
 	-- last few anchor predictions.  emit_oldest masks out any finger whose
 	-- offset is still in the future at the current note's onset, because
@@ -9918,12 +9990,14 @@ function PianoFingering.newSession(isLeftHand: boolean): Session
 		input_buf = buffer.create(INPUT_DIM * FLOAT_SIZE),
 		preact = buffer.create(FOUR_H * FLOAT_SIZE),
 		logits = buffer.create(NUM_FINGERS * FLOAT_SIZE),
+		probs = buffer.create(NUM_FINGERS * FLOAT_SIZE),
 		prev_midi = 0,
 		prev_onset = 0,
 		prev_offset = 0,
 		prev_finger = 0,
 		firstDone = false,
 		pendingOut = {},
+		pendingDist = {},
 		recent = {},
 	}
 end
@@ -10012,7 +10086,11 @@ local function emit_oldest(sess: Session)
 		end
 	end
 
-	local finger = argmax5(sess.logits)
+	-- Compute argmax + full softmax distribution in one pass.  The
+	-- distribution is used by downstream code (VertCost) to scale the
+	-- anchor-match bonus by confidence — a 51/49 near-tie should not pull
+	-- the DP as hard as a 95/2/1/1/1 confident pick.
+	local finger, confidence = softmax5(sess.logits, sess.probs)
 
 	-- Save state for next step
 	sess.prev_midi = cur.midi
@@ -10034,7 +10112,28 @@ local function emit_oldest(sess: Session)
 	sess.recent = keep
 
 	local out_finger = sess.isLeftHand and -finger or finger
-	table.insert(sess.pendingOut, {idx = cur.absIdx, finger = out_finger})
+	table.insert(sess.pendingOut, {
+		idx = cur.absIdx,
+		finger = out_finger,
+		confidence = confidence,
+	})
+	-- Snapshot the distribution as a 5-entry number table so callers using
+	-- drainWithDist don't need to share the session's scratch buffer.
+	-- Fingers are 1..5 in physical order (same as argmax); the mirror /
+	-- sign-flip that applies to `finger` is NOT applied here — the
+	-- distribution describes which physical finger the model picked, and
+	-- downstream code already knows the hand.
+	table.insert(sess.pendingDist, {
+		idx = cur.absIdx,
+		finger = out_finger,
+		dist = {
+			buffer.readf32(sess.probs, 0),
+			buffer.readf32(sess.probs, 1 * FLOAT_SIZE),
+			buffer.readf32(sess.probs, 2 * FLOAT_SIZE),
+			buffer.readf32(sess.probs, 3 * FLOAT_SIZE),
+			buffer.readf32(sess.probs, 4 * FLOAT_SIZE),
+		},
+	})
 	table.remove(sess.pending, 1)
 end
 
@@ -10056,17 +10155,159 @@ function PianoFingering.feed(
 	end
 end
 
-function PianoFingering.drain(sess: Session): {{idx: number, finger: number}}
+-- ----------------------------------------------------------------------------
+-- cloneSession
+--
+-- Produces a deep-enough copy of `sess` that the clone can be fed / drained
+-- independently of the original without corrupting either session's LSTM
+-- state.  Intended use: a DP search wants to try several candidate
+-- continuations from the same anchor, score each, and discard the losers.
+--
+-- Sharing / aliasing contract:
+--   * LSTM state buffers (h0/c0/h1/c1) are byte-copied — mutating the clone's
+--     state does NOT affect the original.
+--   * Scratch buffers (input_buf, preact, logits, probs) are freshly allocated
+--     so concurrent emit_oldest calls on both sessions don't trample each
+--     other's working memory.  (With a single-threaded Lua VM this matters
+--     only if the caller interleaves feed calls between sessions; cheap to
+--     do unconditionally and keeps the API footgun-free.)
+--   * pending / pendingOut / pendingDist / recent are shallow-copied.  Their
+--     entries are append-only dicts that no code path mutates after insert,
+--     so sharing entry refs between the clone and the original is safe and
+--     avoids a second pass of per-entry table allocation.
+--   * Scalars (prev_*, firstDone, nextIdx, isLeftHand) are copied by value.
+-- ----------------------------------------------------------------------------
+local function copyBuffer(src: buffer): buffer
+	local n = buffer.len(src)
+	local dst = buffer.create(n)
+	buffer.copy(dst, 0, src, 0, n)
+	return dst
+end
+
+local function shallowCopyList<T>(src: {T}): {T}
+	local n = #src
+	local dst = table.create(n)
+	for i = 1, n do dst[i] = src[i] end
+	return dst
+end
+
+function PianoFingering.cloneSession(sess: Session): Session
+	return {
+		isLeftHand  = sess.isLeftHand,
+		pending     = shallowCopyList(sess.pending),
+		nextIdx     = sess.nextIdx,
+		h0 = copyBuffer(sess.h0),
+		c0 = copyBuffer(sess.c0),
+		h1 = copyBuffer(sess.h1),
+		c1 = copyBuffer(sess.c1),
+		-- Fresh scratch buffers — see contract above.
+		input_buf = buffer.create(INPUT_DIM * FLOAT_SIZE),
+		preact    = buffer.create(FOUR_H * FLOAT_SIZE),
+		logits    = buffer.create(NUM_FINGERS * FLOAT_SIZE),
+		probs     = buffer.create(NUM_FINGERS * FLOAT_SIZE),
+		prev_midi   = sess.prev_midi,
+		prev_onset  = sess.prev_onset,
+		prev_offset = sess.prev_offset,
+		prev_finger = sess.prev_finger,
+		firstDone   = sess.firstDone,
+		pendingOut  = shallowCopyList(sess.pendingOut),
+		pendingDist = shallowCopyList(sess.pendingDist),
+		recent      = shallowCopyList(sess.recent),
+	} :: Session
+end
+
+-- ----------------------------------------------------------------------------
+-- seed
+--
+-- Prime prev_* fields as if an anchor note at (midi, onset, offset) had just
+-- been emitted with `finger` — WITHOUT running the LSTM for it.  This is the
+-- right call at mid-song phrase resets where the caller already knows the
+-- previous physical finger choice (e.g. it was user-edited, or the caller
+-- just force-picked one to stabilize a pathological branch) but does not want
+-- the LSTM's in-memory h/c state to be updated from that note as if it were
+-- a true inference step.
+--
+-- Semantics differ from feed() in two ways:
+--   1. No LSTM step runs, so h0/c0/h1/c1 are untouched.  The NEXT emit will
+--      therefore condition on whatever LSTM state is already in sess plus
+--      the seeded prev_* features.  If the session is brand-new this gives
+--      a zero-state-but-informed start, which is generally better than the
+--      zero-state-zero-prev start that emit_oldest falls back to when
+--      firstDone=false.
+--   2. `recent` is updated so the same-hand overlap mask still fires for the
+--      seeded note's hold — otherwise a seeded hold-finger could be reused
+--      on the very next anchor, exactly the bug the mask exists to prevent.
+--
+-- `finger` is the PHYSICAL finger index (1..5) regardless of hand.  Caller
+-- must mirror-flip incoming user selections for left hand before passing in.
+-- Pitch mirroring for LH is applied here to match feed()'s stored_midi path.
+-- ----------------------------------------------------------------------------
+function PianoFingering.seed(
+	sess: Session,
+	midi: number, onset: number, offset: number,
+	finger: number
+)
+	local stored_midi = midi
+	if sess.isLeftHand then
+		stored_midi = 2 * CONFIG.middle_c - midi
+	end
+	sess.prev_midi   = stored_midi
+	sess.prev_onset  = onset
+	sess.prev_offset = offset
+	sess.prev_finger = finger
+	sess.firstDone   = true
+	-- Maintain overlap-mask invariant.  Drop stale entries (offset already
+	-- past `onset`) to match emit_oldest's pruning so the list doesn't grow
+	-- unbounded under repeated seeding.
+	local keep = {}
+	for _, r in ipairs(sess.recent) do
+		if r.offset > onset and r.finger ~= finger then
+			table.insert(keep, r)
+		end
+	end
+	table.insert(keep, {finger = finger, offset = offset})
+	sess.recent = keep
+end
+
+function PianoFingering.drain(
+	sess: Session
+): {{idx: number, finger: number, confidence: number?}}
+	-- Both queues are appended to in lockstep by emit_oldest, so resetting
+	-- both here keeps them index-aligned for callers that alternate between
+	-- drain and drainWithDist across a single streaming session.  Callers
+	-- that only ever use one path still pay nothing: the unused queue is
+	-- empty and the `= {}` assignment is a single-allocation reset.
 	local out = sess.pendingOut
+	sess.pendingOut = {}
+	sess.pendingDist = {}
+	return out
+end
+
+function PianoFingering.drainWithDist(
+	sess: Session
+): {{idx: number, finger: number, dist: {number}}}
+	local out = sess.pendingDist
+	sess.pendingDist = {}
 	sess.pendingOut = {}
 	return out
 end
 
-function PianoFingering.flush(sess: Session): {{idx: number, finger: number}}
+function PianoFingering.flush(
+	sess: Session
+): {{idx: number, finger: number, confidence: number?}}
 	while #sess.pending > 0 do
 		emit_oldest(sess)
 	end
 	return PianoFingering.drain(sess)
+end
+
+function PianoFingering.flushWithDist(
+	sess: Session
+): {{idx: number, finger: number, dist: {number}}}
+	while #sess.pending > 0 do
+		emit_oldest(sess)
+	end
+	return PianoFingering.drainWithDist(sess)
 end
 
 function PianoFingering.predict(notes: {any}): {number}
@@ -10091,6 +10332,51 @@ function PianoFingering.predict(notes: {any}): {number}
 	for _, p in ipairs(outR) do result[rhMap[p.idx]] = p.finger end
 	for _, p in ipairs(outL) do result[lhMap[p.idx]] = p.finger end
 	return result
+end
+
+-- Batch counterpart of predict that also returns the per-event posterior.
+-- Return shape:
+--   fingers : {number}             -- same layout as predict(): signed finger per event
+--   dists   : {{number}}           -- dists[i] is a 5-entry table of unsigned physical-finger
+--                                  -- probabilities for event i (aligned with fingers[i]).
+--                                  -- Events that were never emitted (shouldn't happen for
+--                                  -- finite inputs) get an empty table.
+-- The distribution is over PHYSICAL fingers 1..5 regardless of hand; the
+-- sign on fingers[i] encodes handedness only.
+function PianoFingering.predictWithDist(
+	notes: {any}
+): ({number}, {{number}})
+	local T = #notes
+	if T == 0 then return {}, {} end
+	local sessR = PianoFingering.newSession(false)
+	local sessL = PianoFingering.newSession(true)
+	local rhMap, lhMap = {}, {}
+	for i = 1, T do
+		local n = notes[i]
+		if n.isLeftHand then
+			PianoFingering.feed(sessL, n.midi, n.onset, n.offset)
+			table.insert(lhMap, i)
+		else
+			PianoFingering.feed(sessR, n.midi, n.onset, n.offset)
+			table.insert(rhMap, i)
+		end
+	end
+	local outR = PianoFingering.flushWithDist(sessR)
+	local outL = PianoFingering.flushWithDist(sessL)
+	local fingers = table.create(T, 0)
+	local dists: {{number}} = table.create(T)
+	for i = 1, T do dists[i] = {} end
+	for _, p in ipairs(outR) do
+		local gi = rhMap[p.idx]
+		fingers[gi] = p.finger
+		dists[gi] = p.dist
+	end
+	for _, p in ipairs(outL) do
+		local gi = lhMap[p.idx]
+		fingers[gi] = p.finger
+		dists[gi] = p.dist
+	end
+	return fingers, dists
 end
 
 return PianoFingering
