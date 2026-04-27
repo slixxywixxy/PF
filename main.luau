@@ -9734,67 +9734,132 @@ end
 local tanh = math.tanh
 
 -- ----------------------------------------------------------------------------
--- LSTM step (buffer-backed, type-annotated).
+-- LSTM step (buffer-backed, type-annotated, fused 4-gate inner loop).
 --
--- All arguments are buffers of f32. The function reads:
+-- All arguments are buffers of f32.  The function reads:
 --   w_ih at row-major (4H, in_dim), w_hh at (4H, H), bias (4H,), x (in_dim,),
 --   h_prev (H,), c_prev (H,).
 -- And writes:
 --   h_out (H,), c_out (H,).
 --
 -- Gate layout in 4H dimension: i, f, g, o (each H wide, contiguous).
+--
+-- ── Why the loop is structured this way ─────────────────────────────────────
+-- Naive layout iterates k=0..4H-1 and computes one pre-activation per outer
+-- step, reading x[j] and h_prev[j] inside each inner loop.  That re-reads
+-- every x[j] / h_prev[j] FOUR TIMES (once per gate band).  For layer 0
+-- (in_dim=155, hidden=96) that's 384 × 251 ≈ 96k buffer reads of x/h_prev
+-- per LSTM step — and we run two layers per emit, two emits per chord on
+-- average, so this dominates the streaming pipeline's frame budget.
+--
+-- Fused version: outer loop runs k=0..H-1, computing all four gates for
+-- each output unit.  x[j] and h_prev[j] are read ONCE per j in the inner
+-- loop and multiplied against the four gate-band weight rows.  Total
+-- multiplies are unchanged (still 4×H×(in_dim+hidden)), but x/h_prev
+-- reads drop ~75% — roughly 96k → 24k for layer 0.
+--
+-- We also snapshot x and h_prev into Lua tables at the top.  Three reasons:
+--   1. Table reads are cheaper than buffer.readf32 calls in the hot loop.
+--   2. The snapshot makes h_prev == h_out aliasing safe (the original
+--      two-pass version was safe only because preact intermediated; the
+--      fused version writes h_out[k] inside the outer k loop, so without
+--      the snapshot a later k iteration would see clobbered h_prev).
+--   3. The snapshot tables are reused across emits via the session, so
+--      there is no per-emit allocation cost.
+--
+-- The preact scratch buffer is no longer needed — gate pre-activations
+-- live in stack locals (si / sf / sg / so).
 -- ----------------------------------------------------------------------------
 local function lstm_step(
 	w_ih: buffer, w_hh: buffer, bias: buffer,
 	x: buffer, h_prev: buffer, c_prev: buffer,
 	in_dim: number, hidden: number,
 	h_out: buffer, c_out: buffer,
-	preact: buffer        -- scratch: 4*hidden f32s for gate pre-activations
+	x_snap: {number}, h_snap: {number}    -- session-owned scratch tables
 )
-	-- Single-pass pre-activation computation.  The previous implementation
-	-- split this into two passes: the first wrote i/f into h_out/c_out as
-	-- scratch and skipped g/o, then the second recomputed g/o from
-	-- scratch.  That doubled the matmul work for two of the four gates.
-	-- Using a 4H scratch buffer lets every gate row be computed exactly
-	-- once — numerically identical, but ~33% fewer inner-loop multiplies.
-	-- (For layer 0 this is (3 × 96 × 155) vs (6 × 96 × 155) pre-fix.)
-	--
-	-- Keeping the `s` accumulator in a local across the k-row avoids the
-	-- read-accumulate-write-into-preact-every-j pattern, which would cost
-	-- 2 extra buffer ops per inner iteration.
-	local four_h: number = 4 * hidden
-	local in_stride: number = in_dim * FLOAT_SIZE
-	local hh_stride: number = hidden * FLOAT_SIZE
+	local fs: number = FLOAT_SIZE
+	local in_stride: number = in_dim * fs
+	local hh_stride: number = hidden * fs
+	local band_b: number  = hidden * fs           -- bytes between gate bands in bias
+	local band_ih: number = hidden * in_stride    -- bytes between gate bands in w_ih
+	local band_hh: number = hidden * hh_stride    -- bytes between gate bands in w_hh
 
-	for k = 0, four_h - 1 do
-		local s: number = buffer.readf32(bias, k * FLOAT_SIZE)
-		local row_ih_base: number = k * in_stride
-		for j = 0, in_dim - 1 do
-			s += buffer.readf32(w_ih, row_ih_base + j * FLOAT_SIZE)
-				* buffer.readf32(x, j * FLOAT_SIZE)
+	-- Snapshot the inputs into Lua tables once.  See header for the three
+	-- reasons this is faster despite the extra read pass.
+	do
+		local off: number = 0
+		for j = 1, in_dim do
+			x_snap[j] = buffer.readf32(x, off)
+			off += fs
 		end
-		local row_hh_base: number = k * hh_stride
-		for j = 0, hidden - 1 do
-			s += buffer.readf32(w_hh, row_hh_base + j * FLOAT_SIZE)
-				* buffer.readf32(h_prev, j * FLOAT_SIZE)
+		off = 0
+		for j = 1, hidden do
+			h_snap[j] = buffer.readf32(h_prev, off)
+			off += fs
 		end
-		buffer.writef32(preact, k * FLOAT_SIZE, s)
 	end
 
-	-- Activations and output.  Gate layout: i, f, g, o (each H wide).
-	local f_base: number = hidden * FLOAT_SIZE
-	local g_base: number = 2 * hidden * FLOAT_SIZE
-	local o_base: number = 3 * hidden * FLOAT_SIZE
-	for k = 0, hidden - 1 do
-		local k_off: number = k * FLOAT_SIZE
-		local i_gate: number = sigmoid(buffer.readf32(preact, k_off))
-		local f_gate: number = sigmoid(buffer.readf32(preact, f_base + k_off))
-		local g_val:  number = tanh(buffer.readf32(preact, g_base + k_off))
-		local o_gate: number = sigmoid(buffer.readf32(preact, o_base + k_off))
+	-- Pre-compute the 2× / 3× band offsets so the inner loop does not
+	-- re-multiply each iteration.  The Luau native compiler will fold
+	-- these constants into the addresses regardless, but spelling them
+	-- out makes the intent obvious and matches what the optimised path
+	-- looks like once codegen finishes with it.
+	local band_b2: number  = 2 * band_b
+	local band_b3: number  = 3 * band_b
+	local band_ih2: number = 2 * band_ih
+	local band_ih3: number = 3 * band_ih
+	local band_hh2: number = 2 * band_hh
+	local band_hh3: number = 3 * band_hh
+
+	local row_ih: number = 0
+	local row_hh: number = 0
+	local k_off: number  = 0
+	for _ = 0, hidden - 1 do
+		-- Bias initial values for the four gates (i, f, g, o) at row k.
+		local si: number = buffer.readf32(bias, k_off)
+		local sf: number = buffer.readf32(bias, k_off + band_b)
+		local sg: number = buffer.readf32(bias, k_off + band_b2)
+		local so: number = buffer.readf32(bias, k_off + band_b3)
+
+		-- x · W_ih band.  Read x[j] once into a local, multiply against the
+		-- four gate rows of w_ih.  off_w walks down the i-band; the f / g /
+		-- o bands sit at fixed +band_ih{,2,3} offsets from there.
+		local off_w: number = row_ih
+		for j = 1, in_dim do
+			local xj: number = x_snap[j]
+			si += buffer.readf32(w_ih, off_w)              * xj
+			sf += buffer.readf32(w_ih, off_w + band_ih)    * xj
+			sg += buffer.readf32(w_ih, off_w + band_ih2)   * xj
+			so += buffer.readf32(w_ih, off_w + band_ih3)   * xj
+			off_w += fs
+		end
+
+		-- h_prev · W_hh band.  Same pattern as above on the recurrent side.
+		local off_h: number = row_hh
+		for j = 1, hidden do
+			local hj: number = h_snap[j]
+			si += buffer.readf32(w_hh, off_h)              * hj
+			sf += buffer.readf32(w_hh, off_h + band_hh)    * hj
+			sg += buffer.readf32(w_hh, off_h + band_hh2)   * hj
+			so += buffer.readf32(w_hh, off_h + band_hh3)   * hj
+			off_h += fs
+		end
+
+		-- Combine gates into the cell + hidden update.  c_prev[k] is read
+		-- into a local before the c_out[k] write so c_prev == c_out aliasing
+		-- stays safe.
+		local i_gate: number = sigmoid(si)
+		local f_gate: number = sigmoid(sf)
+		local g_val:  number = tanh(sg)
+		local o_gate: number = sigmoid(so)
 		local c_prev_k: number = buffer.readf32(c_prev, k_off)
-		local c_new:  number = f_gate * c_prev_k + i_gate * g_val
+		local c_new: number = f_gate * c_prev_k + i_gate * g_val
 		buffer.writef32(c_out, k_off, c_new)
 		buffer.writef32(h_out, k_off, o_gate * tanh(c_new))
+
+		row_ih += in_stride
+		row_hh += hh_stride
+		k_off  += fs
 	end
 end
 
@@ -9947,15 +10012,35 @@ end
 -- ----------------------------------------------------------------------------
 export type Session = {
 	isLeftHand: boolean,
+	-- pending is a head-indexed circular slice: live entries occupy
+	-- [pending_head .. pending_head + pending_count - 1].  This avoids the
+	-- O(k) shift cost of table.remove(pending, 1) on every emit, which
+	-- noticeably hits big pieces (lookahead_k = 6 means ~6 entries shift
+	-- per emit, multiplied by thousands of emits per song).
 	pending: {any},
+	pending_head: number,
+	pending_count: number,
 	nextIdx: number,
 	-- Per-layer hidden / cell state (persist across steps)
 	h0: buffer, c0: buffer, h1: buffer, c1: buffer,
 	-- Scratch for the inference step
 	input_buf: buffer,
-	preact: buffer,        -- 4*hidden f32s used by lstm_step
+	preact: buffer,        -- vestigial; retained in the type so external
+	                       -- callers that reference it still type-check.
+	                       -- The fused lstm_step no longer reads or writes it.
 	logits: buffer,
 	probs: buffer,         -- NUM_FINGERS f32s; softmax of logits (post-mask)
+	-- Snapshot scratch tables used by lstm_step.  x_snap is sized for the
+	-- larger of the two layer input widths (INPUT_DIM); h_snap holds the
+	-- HIDDEN-wide previous-hidden snapshot.  Reused across emits and across
+	-- the two layers within a single emit, so they cost one allocation per
+	-- session lifetime instead of one per step.
+	x_snap: {number},
+	h_snap: {number},
+	-- Reusable futures slot table — emit_oldest writes the next lookahead_k
+	-- pending entries here so build_input_buf can index by k without us
+	-- allocating a fresh table every emit.
+	futures: {any},
 	prev_midi: number, prev_onset: number, prev_offset: number,
 	prev_finger: number,
 	firstDone: boolean,
@@ -9965,23 +10050,29 @@ export type Session = {
 	-- PianoFingering.drainWithDist if all five probabilities are needed.
 	pendingOut: {{idx: number, finger: number, confidence: number?}},
 	pendingDist: {{idx: number, finger: number, dist: {number}}},
-	-- Same-hand overlap tracker.  Each entry: { finger, offset } for the
-	-- last few anchor predictions.  emit_oldest masks out any finger whose
-	-- offset is still in the future at the current note's onset, because
-	-- a physical finger cannot simultaneously play two different pitches.
-	-- The trained NN never sees held-finger state, so this mask is the
-	-- sole mechanism preventing it from proposing an impossible reuse
-	-- of a still-sounding finger from a prior anchor.
+	-- When false, emit_oldest skips the per-emit pendingDist allocation
+	-- entirely (saves a table + a 5-entry subtable per emit, which is
+	-- meaningful GC pressure on big pieces).  Defaults true to preserve
+	-- the existing API; pass false to newSession when you only call
+	-- drain / flush and never the *WithDist variants.
+	wantDist: boolean,
+	-- Same-hand overlap tracker.  recent is kept in [1 .. recent_count]
+	-- with stale slots past recent_count retained as a tiny entry-table
+	-- pool so the per-emit compaction pass can reuse them instead of
+	-- allocating a fresh entry every step.
 	recent: {{finger: number, offset: number}},
+	recent_count: number,
 }
 
 local PianoFingering = {}
 
-function PianoFingering.newSession(isLeftHand: boolean): Session
+function PianoFingering.newSession(isLeftHand: boolean, wantDist: boolean?): Session
 	local H_BYTES = HIDDEN * FLOAT_SIZE
 	return {
 		isLeftHand = isLeftHand,
 		pending = {},
+		pending_head = 1,
+		pending_count = 0,
 		nextIdx = 1,
 		h0 = buffer.create(H_BYTES),
 		c0 = buffer.create(H_BYTES),
@@ -9991,6 +10082,9 @@ function PianoFingering.newSession(isLeftHand: boolean): Session
 		preact = buffer.create(FOUR_H * FLOAT_SIZE),
 		logits = buffer.create(NUM_FINGERS * FLOAT_SIZE),
 		probs = buffer.create(NUM_FINGERS * FLOAT_SIZE),
+		x_snap = table.create(INPUT_DIM, 0),
+		h_snap = table.create(HIDDEN, 0),
+		futures = table.create(CONFIG.lookahead_k),
 		prev_midi = 0,
 		prev_onset = 0,
 		prev_offset = 0,
@@ -9998,15 +10092,25 @@ function PianoFingering.newSession(isLeftHand: boolean): Session
 		firstDone = false,
 		pendingOut = {},
 		pendingDist = {},
+		-- Default true preserves the original behaviour for callers that
+		-- did not pass the new parameter.  Hot callers pass false.
+		wantDist = wantDist == nil and true or wantDist,
 		recent = {},
+		recent_count = 0,
 	}
 end
 
 local function emit_oldest(sess: Session)
-	local cur = sess.pending[1]
-	local futures = {}
-	for k = 2, 1 + CONFIG.lookahead_k do
-		if sess.pending[k] then table.insert(futures, sess.pending[k]) end
+	local pending = sess.pending
+	local head = sess.pending_head
+	local cur = pending[head]
+
+	-- Reuse the session's futures scratch table.  Writing every slot
+	-- unconditionally clears stale entries from the previous emit; nil at
+	-- a slot means "past the end", which build_input_buf treats as padding.
+	local futures = sess.futures
+	for k = 1, CONFIG.lookahead_k do
+		futures[k] = pending[head + k]
 	end
 
 	-- Use current note's own data as "previous" if this is the first emit
@@ -10023,17 +10127,20 @@ local function emit_oldest(sess: Session)
 	)
 	sess.firstDone = true
 
-	-- Layer 0: x = input_buf; h/c in place on sess.h0/sess.c0.
-	-- lstm_step reads h_prev fully before writing h_out, and reads
-	-- c_prev[k] then writes c_out[k] within a single k iteration, so
-	-- aliasing h_prev==h_out and c_prev==c_out is safe and lets us
-	-- avoid the four scratch->state copies the old code required.
+	-- Layer 0: x = input_buf; h/c in place on sess.h0/sess.c0.  The fused
+	-- lstm_step snapshots h_prev into h_snap before any writes to h_out, so
+	-- h_prev == h_out aliasing remains safe; c_prev[k] is read into a local
+	-- before the c_out[k] write so c_prev == c_out aliasing is safe too.
+	-- Together this lets us avoid the four scratch->state copies the old
+	-- code required.
+	local x_snap = sess.x_snap
+	local h_snap = sess.h_snap
 	lstm_step(
 		W.w_ih_0, W.w_hh_0, W.b_0,
 		sess.input_buf, sess.h0, sess.c0,
 		L0_INPUT, HIDDEN,
 		sess.h0, sess.c0,
-		sess.preact
+		x_snap, h_snap
 	)
 
 	-- Layer 1: x = sess.h0 (layer 0 output); h/c in place on sess.h1/sess.c1.
@@ -10042,7 +10149,7 @@ local function emit_oldest(sess: Session)
 		sess.h0, sess.h1, sess.c1,
 		L1_INPUT, HIDDEN,
 		sess.h1, sess.c1,
-		sess.preact
+		x_snap, h_snap
 	)
 
 	-- Head: h1 -> logits
@@ -10065,25 +10172,37 @@ local function emit_oldest(sess: Session)
 	-- we skip the mask rather than return garbage — the hand can't
 	-- physically play in that state and we let the model's best guess
 	-- fall through for downstream repair.
+	--
+	-- Implementation: 5 stack-allocated booleans instead of a hash map.
+	-- The original `local masked = {}` allocated a new table every emit;
+	-- on big pieces that GC pressure showed up in frame timing.
 	-- --------------------------------------------------------------------
-	local masked: { [number]: boolean }? = nil
+	local m1, m2, m3, m4, m5 = false, false, false, false, false
 	local free_count: number = NUM_FINGERS
-	if #sess.recent > 0 then
-		masked = {}
-		for _, r in ipairs(sess.recent) do
-			if r.offset > cur.onset and not (masked :: any)[r.finger] then
-				(masked :: any)[r.finger] = true
-				free_count -= 1
+	local rc: number = sess.recent_count
+	if rc > 0 then
+		local recent = sess.recent
+		local cur_onset = cur.onset
+		for i = 1, rc do
+			local r = recent[i]
+			if r.offset > cur_onset then
+				local f = r.finger
+				if     f == 1 and not m1 then m1 = true; free_count -= 1
+				elseif f == 2 and not m2 then m2 = true; free_count -= 1
+				elseif f == 3 and not m3 then m3 = true; free_count -= 1
+				elseif f == 4 and not m4 then m4 = true; free_count -= 1
+				elseif f == 5 and not m5 then m5 = true; free_count -= 1
+				end
 			end
 		end
 	end
-	if masked and free_count > 0 then
+	if free_count > 0 and free_count < NUM_FINGERS then
 		local NEG_INF: number = -math.huge
-		for f = 1, NUM_FINGERS do
-			if (masked :: any)[f] then
-				buffer.writef32(sess.logits, (f - 1) * FLOAT_SIZE, NEG_INF)
-			end
-		end
+		if m1 then buffer.writef32(sess.logits, 0,              NEG_INF) end
+		if m2 then buffer.writef32(sess.logits, 1 * FLOAT_SIZE, NEG_INF) end
+		if m3 then buffer.writef32(sess.logits, 2 * FLOAT_SIZE, NEG_INF) end
+		if m4 then buffer.writef32(sess.logits, 3 * FLOAT_SIZE, NEG_INF) end
+		if m5 then buffer.writef32(sess.logits, 4 * FLOAT_SIZE, NEG_INF) end
 	end
 
 	-- Compute argmax + full softmax distribution in one pass.  The
@@ -10098,18 +10217,33 @@ local function emit_oldest(sess: Session)
 	sess.prev_offset = cur.offset
 	sess.prev_finger = finger
 
-	-- Record this anchor for future overlap masking.  Prune entries
-	-- whose note has already released by cur.onset so the list stays
-	-- tiny (at most NUM_FINGERS live entries in practice).
+	-- Record this anchor for future overlap masking.  In-place compaction
+	-- with entry-table reuse: stale slots past the new write index are
+	-- left in the array as a tiny pool that the next emit can recycle
+	-- instead of allocating a fresh { finger=, offset= } table.  recent_count
+	-- tracks the live prefix length so callers don't see the leftovers.
 	local recent = sess.recent
-	local keep = {}
-	for _, r in ipairs(recent) do
-		if r.offset > cur.onset and r.finger ~= finger then
-			table.insert(keep, r)
+	local cur_onset = cur.onset
+	local cur_offset = cur.offset
+	local write_idx: number = 0
+	for i = 1, rc do
+		local r = recent[i]
+		if r.offset > cur_onset and r.finger ~= finger then
+			write_idx += 1
+			if write_idx ~= i then
+				recent[write_idx] = r
+			end
 		end
 	end
-	table.insert(keep, {finger = finger, offset = cur.offset})
-	sess.recent = keep
+	write_idx += 1
+	local entry = recent[write_idx]
+	if entry then
+		entry.finger = finger
+		entry.offset = cur_offset
+	else
+		recent[write_idx] = { finger = finger, offset = cur_offset }
+	end
+	sess.recent_count = write_idx
 
 	local out_finger = sess.isLeftHand and -finger or finger
 	table.insert(sess.pendingOut, {
@@ -10117,24 +10251,36 @@ local function emit_oldest(sess: Session)
 		finger = out_finger,
 		confidence = confidence,
 	})
-	-- Snapshot the distribution as a 5-entry number table so callers using
-	-- drainWithDist don't need to share the session's scratch buffer.
-	-- Fingers are 1..5 in physical order (same as argmax); the mirror /
-	-- sign-flip that applies to `finger` is NOT applied here — the
-	-- distribution describes which physical finger the model picked, and
-	-- downstream code already knows the hand.
-	table.insert(sess.pendingDist, {
-		idx = cur.absIdx,
-		finger = out_finger,
-		dist = {
-			buffer.readf32(sess.probs, 0),
-			buffer.readf32(sess.probs, 1 * FLOAT_SIZE),
-			buffer.readf32(sess.probs, 2 * FLOAT_SIZE),
-			buffer.readf32(sess.probs, 3 * FLOAT_SIZE),
-			buffer.readf32(sess.probs, 4 * FLOAT_SIZE),
-		},
-	})
-	table.remove(sess.pending, 1)
+
+	-- Snapshot the full distribution only when the caller asked for it.
+	-- Hot callers (RbxMidiPlayer's streaming pipeline) only use drain /
+	-- flush, never the *WithDist variants, so allocating a 5-entry table
+	-- per emit just to throw it away is pure GC waste.  When wantDist is
+	-- false we leave pendingDist empty and drainWithDist becomes a no-op.
+	if sess.wantDist then
+		table.insert(sess.pendingDist, {
+			idx = cur.absIdx,
+			finger = out_finger,
+			dist = {
+				buffer.readf32(sess.probs, 0),
+				buffer.readf32(sess.probs, 1 * FLOAT_SIZE),
+				buffer.readf32(sess.probs, 2 * FLOAT_SIZE),
+				buffer.readf32(sess.probs, 3 * FLOAT_SIZE),
+				buffer.readf32(sess.probs, 4 * FLOAT_SIZE),
+			},
+		})
+	end
+
+	-- Pop from the head of the queue.  Setting the slot to nil lets GC
+	-- reclaim the cur table; advancing pending_head avoids the O(n) shift
+	-- that table.remove(pending, 1) would cost.  When the queue empties we
+	-- reset head back to 1 to keep the underlying array compact.
+	pending[head] = nil
+	sess.pending_head = head + 1
+	sess.pending_count -= 1
+	if sess.pending_count == 0 then
+		sess.pending_head = 1
+	end
 end
 
 function PianoFingering.feed(
@@ -10145,12 +10291,16 @@ function PianoFingering.feed(
 	if sess.isLeftHand then
 		stored_midi = 2 * CONFIG.middle_c - midi
 	end
-	table.insert(sess.pending, {
+	-- Append at pending_head + pending_count; entries before pending_head
+	-- are already nil (popped by emit_oldest).  The queue is allowed to
+	-- grow to lookahead_k entries before the next emit fires.
+	sess.pending[sess.pending_head + sess.pending_count] = {
 		midi = stored_midi, onset = onset, offset = offset,
 		absIdx = sess.nextIdx,
-	})
+	}
+	sess.pending_count += 1
 	sess.nextIdx += 1
-	while #sess.pending >= 1 + CONFIG.lookahead_k do
+	while sess.pending_count >= 1 + CONFIG.lookahead_k do
 		emit_oldest(sess)
 	end
 end
@@ -10192,10 +10342,34 @@ local function shallowCopyList<T>(src: {T}): {T}
 end
 
 function PianoFingering.cloneSession(sess: Session): Session
+	-- Compact the head-indexed pending queue into a fresh array starting
+	-- at 1 so the clone's pending_head can also start at 1.  Without this
+	-- the clone would inherit nil leading slots and need to track the
+	-- original head offset, which complicates every consumer.
+	local pc = sess.pending_count
+	local pending_clone = table.create(pc)
+	local head = sess.pending_head
+	for i = 1, pc do
+		pending_clone[i] = sess.pending[head + i - 1]
+	end
+
+	-- recent: copy the live prefix into a fresh array.  Stale entries past
+	-- recent_count are pool entries — not part of logical state — so they
+	-- are not copied; the clone starts with an empty pool and will allocate
+	-- its first entry table on demand.
+	local rc = sess.recent_count
+	local recent_clone = table.create(rc)
+	for i = 1, rc do
+		local r = sess.recent[i]
+		recent_clone[i] = { finger = r.finger, offset = r.offset }
+	end
+
 	return {
-		isLeftHand  = sess.isLeftHand,
-		pending     = shallowCopyList(sess.pending),
-		nextIdx     = sess.nextIdx,
+		isLeftHand   = sess.isLeftHand,
+		pending      = pending_clone,
+		pending_head = 1,
+		pending_count = pc,
+		nextIdx      = sess.nextIdx,
 		h0 = copyBuffer(sess.h0),
 		c0 = copyBuffer(sess.c0),
 		h1 = copyBuffer(sess.h1),
@@ -10205,6 +10379,9 @@ function PianoFingering.cloneSession(sess: Session): Session
 		preact    = buffer.create(FOUR_H * FLOAT_SIZE),
 		logits    = buffer.create(NUM_FINGERS * FLOAT_SIZE),
 		probs     = buffer.create(NUM_FINGERS * FLOAT_SIZE),
+		x_snap    = table.create(INPUT_DIM, 0),
+		h_snap    = table.create(HIDDEN, 0),
+		futures   = table.create(CONFIG.lookahead_k),
 		prev_midi   = sess.prev_midi,
 		prev_onset  = sess.prev_onset,
 		prev_offset = sess.prev_offset,
@@ -10212,7 +10389,9 @@ function PianoFingering.cloneSession(sess: Session): Session
 		firstDone   = sess.firstDone,
 		pendingOut  = shallowCopyList(sess.pendingOut),
 		pendingDist = shallowCopyList(sess.pendingDist),
-		recent      = shallowCopyList(sess.recent),
+		wantDist    = sess.wantDist,
+		recent      = recent_clone,
+		recent_count = rc,
 	} :: Session
 end
 
@@ -10258,15 +10437,29 @@ function PianoFingering.seed(
 	sess.firstDone   = true
 	-- Maintain overlap-mask invariant.  Drop stale entries (offset already
 	-- past `onset`) to match emit_oldest's pruning so the list doesn't grow
-	-- unbounded under repeated seeding.
-	local keep = {}
-	for _, r in ipairs(sess.recent) do
+	-- unbounded under repeated seeding.  Same in-place compaction +
+	-- entry-table reuse as emit_oldest.
+	local recent = sess.recent
+	local rc = sess.recent_count
+	local write_idx: number = 0
+	for i = 1, rc do
+		local r = recent[i]
 		if r.offset > onset and r.finger ~= finger then
-			table.insert(keep, r)
+			write_idx += 1
+			if write_idx ~= i then
+				recent[write_idx] = r
+			end
 		end
 	end
-	table.insert(keep, {finger = finger, offset = offset})
-	sess.recent = keep
+	write_idx += 1
+	local entry = recent[write_idx]
+	if entry then
+		entry.finger = finger
+		entry.offset = offset
+	else
+		recent[write_idx] = { finger = finger, offset = offset }
+	end
+	sess.recent_count = write_idx
 end
 
 function PianoFingering.drain(
@@ -10295,7 +10488,7 @@ end
 function PianoFingering.flush(
 	sess: Session
 ): {{idx: number, finger: number, confidence: number?}}
-	while #sess.pending > 0 do
+	while sess.pending_count > 0 do
 		emit_oldest(sess)
 	end
 	return PianoFingering.drain(sess)
@@ -10304,7 +10497,7 @@ end
 function PianoFingering.flushWithDist(
 	sess: Session
 ): {{idx: number, finger: number, dist: {number}}}
-	while #sess.pending > 0 do
+	while sess.pending_count > 0 do
 		emit_oldest(sess)
 	end
 	return PianoFingering.drainWithDist(sess)
@@ -10313,8 +10506,10 @@ end
 function PianoFingering.predict(notes: {any}): {number}
 	local T = #notes
 	if T == 0 then return {} end
-	local sessR = PianoFingering.newSession(false)
-	local sessL = PianoFingering.newSession(true)
+	-- predict() never returns the dist, so opt out of pendingDist
+	-- allocations to save GC pressure on long input lists.
+	local sessR = PianoFingering.newSession(false, false)
+	local sessL = PianoFingering.newSession(true, false)
 	local rhMap, lhMap = {}, {}
 	for i = 1, T do
 		local n = notes[i]
@@ -10348,8 +10543,10 @@ function PianoFingering.predictWithDist(
 ): ({number}, {{number}})
 	local T = #notes
 	if T == 0 then return {}, {} end
-	local sessR = PianoFingering.newSession(false)
-	local sessL = PianoFingering.newSession(true)
+	-- Explicit wantDist = true keeps the original behaviour even though it
+	-- is the default — calling it out makes the contract obvious.
+	local sessR = PianoFingering.newSession(false, true)
+	local sessL = PianoFingering.newSession(true, true)
 	local rhMap, lhMap = {}, {}
 	for i = 1, T do
 		local n = notes[i]
