@@ -9864,27 +9864,31 @@ local function lstm_step(
 end
 
 -- Linear head: out (num_fingers,) = head_w (num_fingers, H) * h + head_b
+-- Walking offsets in both loops match the style of lstm_step and let the
+-- native compiler emit add-with-displacement loads instead of recomputing
+-- multiplications each iteration.
 local function linear_head(h: buffer, out: buffer)
-	for i = 0, NUM_FINGERS - 1 do
-		local row_base: number = i * HIDDEN * FLOAT_SIZE
-		local s: number = buffer.readf32(W.head_b, i * FLOAT_SIZE)
-		for j = 0, HIDDEN - 1 do
-			s += buffer.readf32(W.head_w, row_base + j * FLOAT_SIZE)
-				* buffer.readf32(h, j * FLOAT_SIZE)
+	local fs: number = FLOAT_SIZE
+	local row_stride: number = HIDDEN * fs
+	local row_base: number = 0
+	local out_off: number = 0
+	for _ = 0, NUM_FINGERS - 1 do
+		local s: number = buffer.readf32(W.head_b, out_off)
+		local off_w: number = row_base
+		local off_h: number = 0
+		for _ = 0, HIDDEN - 1 do
+			s += buffer.readf32(W.head_w, off_w) * buffer.readf32(h, off_h)
+			off_w += fs
+			off_h += fs
 		end
-		buffer.writef32(out, i * FLOAT_SIZE, s)
+		buffer.writef32(out, out_off, s)
+		row_base += row_stride
+		out_off += fs
 	end
 end
 
-local function argmax5(buf: buffer): number
-	local best_i: number = 1
-	local best_v: number = buffer.readf32(buf, 0)
-	for i = 1, 4 do
-		local v: number = buffer.readf32(buf, i * FLOAT_SIZE)
-		if v > best_v then best_v = v; best_i = i + 1 end
-	end
-	return best_i
-end
+-- (argmax5 was removed — softmax5 returns the argmax alongside its
+-- probability, so the standalone helper had no remaining callers.)
 
 -- Numerically-stable softmax over the 5 finger logits.  Writes probabilities
 -- into `out` (same layout as `logits`) and returns the argmax alongside its
@@ -9966,12 +9970,12 @@ local function build_input_buf(
 	-- Zero the buffer first (one shot; cheap)
 	buffer.fill(buf, 0, 0, INPUT_DIM * FLOAT_SIZE)
 
-	-- Copy embedding row into first E slots
+	-- Copy embedding row into first E slots in one bulk move instead of
+	-- the per-element readf32/writef32 pair the original used.  buffer.copy
+	-- is a memcpy-style intrinsic; even on the small E=64-ish range this
+	-- collapses ~128 buffer ops into a single call per emit.
 	local src_base: number = embed_idx * E * FLOAT_SIZE
-	for i = 0, E - 1 do
-		buffer.writef32(buf, i * FLOAT_SIZE,
-			buffer.readf32(W.embed, src_base + i * FLOAT_SIZE))
-	end
+	buffer.copy(buf, 0, W.embed, src_base, E * FLOAT_SIZE)
 
 	-- Current-note features start at offset E
 	local NC = CONFIG.num_current_feats
@@ -10105,6 +10109,15 @@ local function emit_oldest(sess: Session)
 	local head = sess.pending_head
 	local cur = pending[head]
 
+	-- Cache the current note's fields once.  emit_oldest reads each of
+	-- these 2-3 times across the function and table lookups in Luau aren't
+	-- free, even with --!native — the locals also let the native compiler
+	-- keep them in registers across the LSTM call boundary.
+	local cur_midi: number = cur.midi
+	local cur_onset: number = cur.onset
+	local cur_offset: number = cur.offset
+	local cur_absIdx: number = cur.absIdx
+
 	-- Reuse the session's futures scratch table.  Writing every slot
 	-- unconditionally clears stale entries from the previous emit; nil at
 	-- a slot means "past the end", which build_input_buf treats as padding.
@@ -10114,12 +10127,12 @@ local function emit_oldest(sess: Session)
 	end
 
 	-- Use current note's own data as "previous" if this is the first emit
-	local prev_midi: number = sess.firstDone and sess.prev_midi or cur.midi
-	local prev_onset: number = sess.firstDone and sess.prev_onset or cur.onset
+	local prev_midi: number = sess.firstDone and sess.prev_midi or cur_midi
+	local prev_onset: number = sess.firstDone and sess.prev_onset or cur_onset
 
 	build_input_buf(
 		sess.input_buf,
-		cur.midi, cur.onset, cur.offset,
+		cur_midi, cur_onset, cur_offset,
 		prev_midi, prev_onset,
 		futures,
 		not sess.firstDone,
@@ -10179,19 +10192,30 @@ local function emit_oldest(sess: Session)
 	-- --------------------------------------------------------------------
 	local m1, m2, m3, m4, m5 = false, false, false, false, false
 	local free_count: number = NUM_FINGERS
+	-- Soonest-to-release tracker: when EVERY finger ends up masked we
+	-- need a defensible fallback because the model would otherwise pick
+	-- a guaranteed-occupied finger.  The least-bad answer is the finger
+	-- whose held note ends earliest — by the time the user actually
+	-- presses cur, that finger is most likely to be free.
+	local soonest_finger: number = 0
+	local soonest_offset: number = math.huge
 	local rc: number = sess.recent_count
 	if rc > 0 then
 		local recent = sess.recent
-		local cur_onset = cur.onset
 		for i = 1, rc do
 			local r = recent[i]
-			if r.offset > cur_onset then
+			local r_off: number = r.offset
+			if r_off > cur_onset then
 				local f = r.finger
 				if     f == 1 and not m1 then m1 = true; free_count -= 1
 				elseif f == 2 and not m2 then m2 = true; free_count -= 1
 				elseif f == 3 and not m3 then m3 = true; free_count -= 1
 				elseif f == 4 and not m4 then m4 = true; free_count -= 1
 				elseif f == 5 and not m5 then m5 = true; free_count -= 1
+				end
+				if r_off < soonest_offset then
+					soonest_offset = r_off
+					soonest_finger = f
 				end
 			end
 		end
@@ -10211,10 +10235,23 @@ local function emit_oldest(sess: Session)
 	-- the DP as hard as a 95/2/1/1/1 confident pick.
 	local finger, confidence = softmax5(sess.logits, sess.probs)
 
+	-- All five fingers physically held: the model's pick is guaranteed
+	-- wrong (every finger is occupied by an earlier still-sounding note).
+	-- Override with the finger whose held note will release first.  This
+	-- can't be exactly right — by definition the hand is overcommitted —
+	-- but it produces the most plausible recovery and lets the rule-based
+	-- DP downstream see a consistent signal instead of a random pick.
+	if free_count == 0 and soonest_finger ~= 0 then
+		finger = soonest_finger
+		-- Confidence is genuinely low here; flag it as such so VertCost
+		-- doesn't weight the bias heavily.
+		confidence = 0.2
+	end
+
 	-- Save state for next step
-	sess.prev_midi = cur.midi
-	sess.prev_onset = cur.onset
-	sess.prev_offset = cur.offset
+	sess.prev_midi = cur_midi
+	sess.prev_onset = cur_onset
+	sess.prev_offset = cur_offset
 	sess.prev_finger = finger
 
 	-- Record this anchor for future overlap masking.  In-place compaction
@@ -10223,8 +10260,6 @@ local function emit_oldest(sess: Session)
 	-- instead of allocating a fresh { finger=, offset= } table.  recent_count
 	-- tracks the live prefix length so callers don't see the leftovers.
 	local recent = sess.recent
-	local cur_onset = cur.onset
-	local cur_offset = cur.offset
 	local write_idx: number = 0
 	for i = 1, rc do
 		local r = recent[i]
@@ -10247,7 +10282,7 @@ local function emit_oldest(sess: Session)
 
 	local out_finger = sess.isLeftHand and -finger or finger
 	table.insert(sess.pendingOut, {
-		idx = cur.absIdx,
+		idx = cur_absIdx,
 		finger = out_finger,
 		confidence = confidence,
 	})
@@ -10259,7 +10294,7 @@ local function emit_oldest(sess: Session)
 	-- false we leave pendingDist empty and drainWithDist becomes a no-op.
 	if sess.wantDist then
 		table.insert(sess.pendingDist, {
-			idx = cur.absIdx,
+			idx = cur_absIdx,
 			finger = out_finger,
 			dist = {
 				buffer.readf32(sess.probs, 0),
